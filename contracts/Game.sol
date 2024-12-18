@@ -239,11 +239,13 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
         // calculate and set new query fee
 
-        uint256 newQueryFee = gameSettings.queryFee +
-            (gameSettings.queryFee * gameSettings.queryFeeIncrement) /
-            (10 ** 20);
+        if (gameSettings.queryFee < gameSettings.maxQueryFee) {
+            uint256 newQueryFee = gameSettings.queryFee +
+                (gameSettings.queryFee * gameSettings.queryFeeIncrement) /
+                (10 ** 20);
 
-        gameSettings.queryFee = newQueryFee;
+            gameSettings.queryFee = newQueryFee;
+        }
 
         // register and process user prompt
 

@@ -1,5 +1,7 @@
 require("@nomicfoundation/hardhat-toolbox");
 
+const { signerAddress, signerKey, networks } = require("./config");
+
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
 	solidity: {
@@ -16,4 +18,6 @@ module.exports = {
 
 		viaIR: true,
 	},
+
+	networks,
 };
