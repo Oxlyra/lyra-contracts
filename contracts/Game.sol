@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.21;
 
 import "hardhat/console.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -40,6 +40,15 @@ contract Game is Ownable, AIOracleCallbackReceiver {
         uint256 queryIndex;
     }
 
+    struct PlayerRequestData {
+        uint256 requestId;
+        uint256 queryIndex;
+        uint256 pricePoolShare;
+        uint256 devWalletShare;
+        address sender;
+        bytes input;
+    }
+
     // Events -------
 
     event LyraGameDeployed(uint256 timestamp, GameSettings settings);
@@ -66,16 +75,10 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
     // Custom Errors ------------
 
-    error InvalidDevWallet();
-    error InvalidQueryFeeIncrement();
-    error InvalidGameDuration();
-    error InvalidMaxQueryFee();
     error AmountLessThanQueryFee();
     error AmountLessThanQueryFeePlusSlippage();
     error GameHasNotStarted();
     error GameHasEnded();
-    error MustBeAPercentage();
-    error MustSumToPercentage();
     error FailedToSendEthers();
     error AIRequestDoesNotExist();
     error PlayerQueryDoesNotExist();
@@ -85,6 +88,8 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     error GameIsInProgress();
     error AlreadyRefunded();
     error UnableToProcessRefund();
+    error UnsupportedModel();
+
     // State Vars -----------
 
     address public winner;
@@ -99,6 +104,8 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     mapping(address => mapping(uint256 => PlayerQuery)) public playerQueries;
     mapping(address => uint256) public playerQueryCount;
 
+    bytes constant EMPTY_BYTES = bytes("");
+
     constructor(
         address _devWallet,
         address _owner,
@@ -106,29 +113,32 @@ contract Game is Ownable, AIOracleCallbackReceiver {
         IAIOracle _aiOracle
     ) payable Ownable(_owner) AIOracleCallbackReceiver(_aiOracle) {
         // Sanity Checks
-        require(_devWallet != address(0), InvalidDevWallet());
+        require(_devWallet != address(0), "Invalid Dev Wallet");
 
-        require(_settings.queryFeeIncrement >= 0, InvalidQueryFeeIncrement());
+        require(
+            _settings.queryFeeIncrement >= 0,
+            "Invalid Query Fee Increment"
+        );
 
-        require(_settings.maxQueryFee > 0, InvalidMaxQueryFee());
+        require(_settings.maxQueryFee > 0, "Invalid Max Query Fee");
 
-        require(_settings.gameDuration >= 5 minutes, InvalidGameDuration());
+        require(_settings.gameDuration >= 5 minutes, "Invalid Game Duration");
 
         require(
             _settings.devWalletPercentage >= 0 &&
                 _settings.devWalletPercentage <= 100,
-            MustBeAPercentage()
+            "Must be between 0 and 100"
         );
         require(
             _settings.pricePoolPercentage >= 0 &&
                 _settings.pricePoolPercentage <= 100,
-            MustBeAPercentage()
+            "Must be between 0 and 100"
         );
 
         require(
             _settings.devWalletPercentage + _settings.pricePoolPercentage ==
                 100,
-            MustSumToPercentage()
+            "DevWalletPercentage and pricePoolPercentage must sum to 100"
         );
 
         // persist
@@ -143,7 +153,6 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
         // Preset Gas limits for models
 
-        callbackGasLimit[50] = 500_000; // Stable-Diffusion
         callbackGasLimit[11] = 5_000_000; // Llama
 
         emit LyraGameDeployed(block.timestamp, _settings);
@@ -157,55 +166,76 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     ) external payable {
         // Sanity Checks
 
-        require(
-            gameSettings.gameStartTime >= block.timestamp,
-            GameHasNotStarted()
-        );
+        if (callbackGasLimit[modelId] == 0) {
+            revert UnsupportedModel();
+        }
 
-        require(
-            gameSettings.gameStartTime + gameSettings.gameDuration >
-                block.timestamp,
-            GameHasEnded()
-        );
+        if (gameSettings.gameStartTime > block.timestamp) {
+            revert GameHasNotStarted();
+        }
 
-        require(winner == address(0), WinnerAlreadyExists());
+        if (
+            block.timestamp >
+            (gameSettings.gameStartTime + gameSettings.gameDuration)
+        ) {
+            revert GameHasEnded();
+        }
 
-        require(msg.value >= gameSettings.queryFee, AmountLessThanQueryFee());
+        if (winner != address(0)) {
+            revert WinnerAlreadyExists();
+        }
+
+        if (gameSettings.queryFee > msg.value) {
+            revert AmountLessThanQueryFee();
+        }
 
         uint256 slippageAmount = (gameSettings.queryFee * queryFeeMinSlippage) /
             100;
 
         uint256 expectedQueryFee = gameSettings.queryFee + slippageAmount;
 
-        require(
-            msg.value >= expectedQueryFee,
-            AmountLessThanQueryFeePlusSlippage()
-        );
+        if (expectedQueryFee > msg.value) {
+            revert AmountLessThanQueryFeePlusSlippage();
+        }
 
         uint256 excessQueryFee = msg.value - gameSettings.queryFee;
 
         if (excessQueryFee > 0) {
             bool success = _sendEthers(msg.sender, excessQueryFee);
-            require(success, FailedToSendEthers());
+
+            if (!success) {
+                revert FailedToSendEthers();
+            }
         }
 
         uint256 value = msg.value - excessQueryFee;
 
-        uint256 devWalletShare = (value * gameSettings.devWalletPercentage) /
+        PlayerRequestData memory playerData;
+        playerData.devWalletShare =
+            (value * gameSettings.devWalletPercentage) /
             100;
 
-        uint256 pricePoolShare = value - devWalletShare;
+        // * Gas estimation for OAO callback
+
+        uint256 oaoCallbackGasFee = _estimateCallbackFee(modelId);
+
+        playerData.pricePoolShare =
+            value -
+            (playerData.devWalletShare + oaoCallbackGasFee);
 
         // credit dev wallet
 
-        if (devWalletShare > 0) {
-            bool success = _sendEthers(devWallet, devWalletShare);
-            require(success, FailedToSendEthers());
+        if (playerData.devWalletShare > 0) {
+            bool success = _sendEthers(devWallet, playerData.devWalletShare);
+
+            if (!success) {
+                revert FailedToSendEthers();
+            }
         }
 
         // add to pool
 
-        pool += pricePoolShare;
+        pool += playerData.pricePoolShare;
 
         // calculate and set new query fee
 
@@ -217,40 +247,45 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
         // register and process user prompt
 
-        bytes memory input = bytes(inputMessage);
-        bytes memory callbackData = bytes("");
+        playerData.input = bytes(inputMessage);
 
-        // TODO Gas estimation
         playerQueryCount[msg.sender] += 1;
 
-        uint256 requestId = _processPrompt(
+        playerData.requestId = _processPrompt(
             modelId,
-            input,
-            callbackData,
-            pricePoolShare
+            playerData.input,
+            EMPTY_BYTES,
+            oaoCallbackGasFee
         );
 
-        AIOracleRequest memory aiRequest;
+        playerData.queryIndex = playerQueryCount[msg.sender];
+        playerData.sender = msg.sender;
 
-        aiRequest.sender = msg.sender;
-        aiRequest.modelId = modelId;
+        requests[playerData.requestId] = AIOracleRequest({
+            sender: playerData.sender,
+            modelId: modelId,
+            input: playerData.input,
+            output: EMPTY_BYTES,
+            queryIndex: playerData.queryIndex
+        });
 
-        aiRequest.input = input;
+        playerQueries[msg.sender][playerData.queryIndex] = PlayerQuery({
+            sender: playerData.sender,
+            timestamp: block.timestamp,
+            requestId: playerData.requestId,
+            fee: playerData.pricePoolShare,
+            won: false,
+            failed: false,
+            refunded: false,
+            score: 0
+        });
 
-        aiRequest.queryIndex = playerQueryCount[msg.sender];
-
-        requests[requestId] = aiRequest;
-
-        PlayerQuery memory playerQuery;
-
-        playerQuery.sender = msg.sender;
-        playerQuery.timestamp = block.timestamp;
-        playerQuery.requestId = requestId;
-        playerQuery.fee = pricePoolShare;
-
-        playerQueries[msg.sender][playerQueryCount[msg.sender]] = playerQuery;
-
-        emit PlayerAttempt(requestId, msg.sender, modelId, inputMessage);
+        emit PlayerAttempt(
+            playerData.requestId,
+            msg.sender,
+            modelId,
+            inputMessage
+        );
     }
 
     // * RESPONSE FROM OAO ----
@@ -262,7 +297,9 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     ) external override onlyAIOracleCallback {
         AIOracleRequest memory request = requests[requestId];
 
-        require(request.sender != address(0), AIRequestDoesNotExist());
+        if (request.sender == address(0)) {
+            revert AIRequestDoesNotExist();
+        }
 
         request.output = output;
 
@@ -270,7 +307,9 @@ contract Game is Ownable, AIOracleCallbackReceiver {
             request.queryIndex
         ];
 
-        require(playerQuery.sender != address(0), PlayerQueryDoesNotExist());
+        if (playerQuery.sender == address(0)) {
+            revert PlayerQueryDoesNotExist();
+        }
 
         uint8 playerScore = _decodeScore(output);
 
@@ -317,7 +356,9 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
                 bool success = _sendEthers(winner, reward);
 
-                require(success, FailedToSendEthers());
+                if (!success) {
+                    revert FailedToSendEthers();
+                }
             } else {
                 revert WinnerRewardConditionsNotMet();
             }
@@ -328,13 +369,21 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
     function refundPlayer() external {
         // Sanity checks
-        require(playerQueryCount[msg.sender] > 0, NotAParticipant());
-        require(winner == address(0), WinnerAlreadyExists());
-        require(
-            block.timestamp >
-                (gameSettings.gameStartTime + gameSettings.gameDuration),
-            GameIsInProgress()
-        );
+
+        if (playerQueryCount[msg.sender] == 0) {
+            revert NotAParticipant();
+        }
+
+        if (winner != address(0)) {
+            revert WinnerAlreadyExists();
+        }
+
+        if (
+            (gameSettings.gameStartTime + gameSettings.gameDuration) >
+            block.timestamp
+        ) {
+            revert GameIsInProgress();
+        }
 
         uint256 refundDue = 0;
 
@@ -349,17 +398,27 @@ contract Game is Ownable, AIOracleCallbackReceiver {
             }
         }
 
-        require(refundDue > 0, AlreadyRefunded());
+        if (refundDue == 0) {
+            revert AlreadyRefunded();
+        }
 
         if (address(this).balance >= refundDue) {
             bool success = _sendEthers(msg.sender, refundDue);
 
-            require(success, FailedToSendEthers());
+            if (!success) {
+                revert FailedToSendEthers();
+            }
 
             emit PlayerRefunded(msg.sender, refundDue);
         } else {
             revert UnableToProcessRefund();
         }
+    }
+
+    // *FETCH GAS ESTIMATE FOR OAO MODEL CALLBACK
+
+    function getGasEstimate(uint256 modelId) external view returns (uint256) {
+        return _estimateCallbackFee(modelId);
     }
 
     // Internal Functions -------------------
@@ -402,6 +461,12 @@ contract Game is Ownable, AIOracleCallbackReceiver {
         return 200;
     }
 
+    function _estimateCallbackFee(
+        uint256 modelId
+    ) public view returns (uint256) {
+        return aiOracle.estimateFee(modelId, callbackGasLimit[modelId]);
+    }
+
     // Admin funcs ------------
 
     function setCallbackGasLimit(
@@ -412,13 +477,16 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     }
 
     function setDevWallet(address _devWallet) external onlyOwner {
-        require(_devWallet != address(0), InvalidDevWallet());
+        require(_devWallet != address(0), "Invalid Dev Wallet");
 
         devWallet = _devWallet;
     }
 
     function setMinSlippgae(uint8 _slippage) external onlyOwner {
-        require(_slippage >= 0 && _slippage <= 100, MustBeAPercentage());
+        require(
+            _slippage >= 0 && _slippage <= 100,
+            "Slippage must be between 0 and 100"
+        );
         queryFeeMinSlippage = _slippage;
     }
 }
