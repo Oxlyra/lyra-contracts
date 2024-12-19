@@ -26,6 +26,8 @@ const errorSignatures = {
 Object.values(errorSignatures).forEach((v) => [console.log(v, web3.eth.abi.encodeFunctionSignature(v))]);
 
 function getErrorName(data) {
+	if (!data) return null;
+
 	const errorSignature = data.slice(0, 10); // Get the first 4 bytes (10 hex characters)
 	for (const [name, signature] of Object.entries(errorSignatures)) {
 		const encodedSignature = web3.eth.abi.encodeFunctionSignature(signature);
@@ -111,7 +113,7 @@ describe("Game", () => {
 
 			console.log("Transaction: ", tx);
 		} catch (e) {
-			console.log("Decoded Error: ", getErrorName(e.cause.data));
+			console.log("Decoded Error: ", getErrorName(e?.cause?.data));
 
 			console.log(e);
 		}
