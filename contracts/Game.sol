@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 import "./OAO/contracts/interfaces/IAIOracle.sol";
 import "./OAO/contracts/AIOracleCallbackReceiver.sol";
+import "./SystemPrompt.sol";
 
 contract Game is Ownable, AIOracleCallbackReceiver {
     using Strings for uint8;
@@ -104,6 +105,8 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     mapping(address => mapping(uint256 => PlayerQuery)) public playerQueries;
     mapping(address => uint256) public playerQueryCount;
 
+    string public constant name = "LyraVerse 01";
+
     bytes constant EMPTY_BYTES = bytes("");
 
     constructor(
@@ -185,7 +188,11 @@ contract Game is Ownable, AIOracleCallbackReceiver {
             revert WinnerAlreadyExists();
         }
 
-        if (gameSettings.queryFee > msg.value) {
+        // * Gas estimation for OAO callback
+
+        uint256 oaoCallbackGasFee = _estimateCallbackFee(modelId);
+
+        if (msg.value < gameSettings.queryFee + oaoCallbackGasFee) {
             revert AmountLessThanQueryFee();
         }
 
@@ -194,11 +201,12 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
         uint256 expectedQueryFee = gameSettings.queryFee + slippageAmount;
 
-        if (expectedQueryFee > msg.value) {
+        if (msg.value < expectedQueryFee + oaoCallbackGasFee) {
             revert AmountLessThanQueryFeePlusSlippage();
         }
 
-        uint256 excessQueryFee = msg.value - gameSettings.queryFee;
+        uint256 excessQueryFee = msg.value -
+            (gameSettings.queryFee + oaoCallbackGasFee);
 
         if (excessQueryFee > 0) {
             bool success = _sendEthers(msg.sender, excessQueryFee);
@@ -208,20 +216,14 @@ contract Game is Ownable, AIOracleCallbackReceiver {
             }
         }
 
-        uint256 value = msg.value - excessQueryFee;
+        uint256 value = msg.value - (excessQueryFee + oaoCallbackGasFee);
 
         PlayerRequestData memory playerData;
         playerData.devWalletShare =
             (value * gameSettings.devWalletPercentage) /
             100;
 
-        // * Gas estimation for OAO callback
-
-        uint256 oaoCallbackGasFee = _estimateCallbackFee(modelId);
-
-        playerData.pricePoolShare =
-            value -
-            (playerData.devWalletShare + oaoCallbackGasFee);
+        playerData.pricePoolShare = value - playerData.devWalletShare;
 
         // credit dev wallet
 
@@ -255,7 +257,7 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
         playerData.requestId = _processPrompt(
             modelId,
-            playerData.input,
+            _getPromptWithUserMessage(playerData.input),
             EMPTY_BYTES,
             oaoCallbackGasFee
         );
@@ -304,6 +306,8 @@ contract Game is Ownable, AIOracleCallbackReceiver {
         }
 
         request.output = output;
+
+        requests[requestId] = request;
 
         PlayerQuery memory playerQuery = playerQueries[request.sender][
             request.queryIndex
@@ -417,6 +421,11 @@ contract Game is Ownable, AIOracleCallbackReceiver {
         }
     }
 
+    // *FETCH SYSTEM PROMPT
+    function getPrompt() external pure returns (string memory) {
+        return SystemPrompt.PROMPT;
+    }
+
     // *FETCH GAS ESTIMATE FOR OAO MODEL CALLBACK
 
     function getGasEstimate(uint256 modelId) external view returns (uint256) {
@@ -424,6 +433,18 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     }
 
     // Internal Functions -------------------
+
+    function _getPromptWithUserMessage(
+        bytes memory userAttempt
+    ) internal pure returns (bytes memory) {
+        return
+            abi.encodePacked(
+                bytes(SystemPrompt.PROMPT),
+                "User's Attempt:\n'",
+                userAttempt,
+                "'\n"
+            );
+    }
 
     function _sendEthers(
         address _recipient,
@@ -465,7 +486,7 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
     function _estimateCallbackFee(
         uint256 modelId
-    ) public view returns (uint256) {
+    ) internal view returns (uint256) {
         return aiOracle.estimateFee(modelId, callbackGasLimit[modelId]);
     }
 

@@ -1,5 +1,5 @@
 const { buildModule } = require("@nomicfoundation/hardhat-ignition/modules");
-const { constructorArgs } = require("../config");
+const { constructorArgs } = require("../../config");
 
 const DEV_WALLET = constructorArgs.devWallet;
 const OWNER_ADDRESS = constructorArgs.owner;
