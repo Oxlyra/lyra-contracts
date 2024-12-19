@@ -168,7 +168,7 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     function play(
         string calldata inputMessage,
         uint256 modelId
-    ) external payable {
+    ) external payable returns (uint256) {
         // Sanity Checks
 
         if (callbackGasLimit[modelId] == 0) {
@@ -298,6 +298,8 @@ contract Game is Ownable, AIOracleCallbackReceiver {
             modelId,
             inputMessage
         );
+
+        return playerData.requestId;
     }
 
     // * RESPONSE FROM OAO ----
