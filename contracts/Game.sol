@@ -97,6 +97,8 @@ contract Game is Ownable, AIOracleCallbackReceiver {
     PlayerQuery public winnerQuery;
     address devWallet;
     uint256 public initialPricePool;
+    uint256 public totalAttempts;
+    uint256 public totalPlayers;
     uint256 public pool;
     uint8 public queryFeeMinSlippage;
     GameSettings public gameSettings;
@@ -253,7 +255,13 @@ contract Game is Ownable, AIOracleCallbackReceiver {
 
         playerData.input = bytes(inputMessage);
 
+        if (playerQueryCount[msg.sender] == 0) {
+            totalPlayers += 1;
+        }
+
         playerQueryCount[msg.sender] += 1;
+
+        totalAttempts += 1;
 
         playerData.requestId = _processPrompt(
             modelId,
