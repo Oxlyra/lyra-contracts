@@ -3,7 +3,6 @@ const { constructorArgs } = require("../../config");
 
 const DEV_WALLET = constructorArgs.devWallet;
 const OWNER_ADDRESS = constructorArgs.owner;
-const AI_ORACLE_ADDRESS = constructorArgs.aiOracleAddress;
 const SETTINGS = [
 	constructorArgs.gameSettings.queryFee,
 	constructorArgs.gameSettings.queryFeeIncrement,
@@ -14,7 +13,7 @@ const SETTINGS = [
 	constructorArgs.gameSettings.devWalletPercentage,
 ];
 
-const DEPLOYMENT_ARGS = [DEV_WALLET, OWNER_ADDRESS, SETTINGS, AI_ORACLE_ADDRESS];
+const DEPLOYMENT_ARGS = [OWNER_ADDRESS, DEV_WALLET, SETTINGS];
 
 module.exports = buildModule("Game", (m) => {
 	const game = m.contract("Game", DEPLOYMENT_ARGS);

@@ -2,28 +2,27 @@ const { Web3 } = require("web3");
 const { networks, accounts, wallets, gameAddress, constructorArgs } = require("../config");
 const { expect } = require("chai");
 
-const web3 = new Web3(networks.arbitrumSepolia.url);
+const web3 = new Web3(networks.bscTestnet.url);
 
 web3.handleRevert = true;
 
 const errorSignatures = {
-	AmountLessThanQueryFee: "AmountLessThanQueryFee()",
-	AmountLessThanQueryFeePlusSlippage: "AmountLessThanQueryFeePlusSlippage()",
-	GameHasNotStarted: "GameHasNotStarted()",
-	GameHasEnded: "GameHasEnded()",
-	FailedToSendEthers: "FailedToSendEthers()",
-	AIRequestDoesNotExist: "AIRequestDoesNotExist()",
-	PlayerQueryDoesNotExist: "PlayerQueryDoesNotExist()",
+	InsufficientQueryFee: "InsufficientQueryFee()",
+	InsufficientQueryFeeWithSlippage: "InsufficientQueryFeeWithSlippage()",
+	GameNotStarted: "GameNotStarted()",
+	GameEnded: "GameEnded()",
+	EtherTransferFailed: "EtherTransferFailed()",
+	PlayerAttemptNotFound: "PlayerAttemptNotFound()",
 	WinnerRewardConditionsNotMet: "WinnerRewardConditionsNotMet()",
-	WinnerAlreadyExists: "WinnerAlreadyExists()",
-	NotAParticipant: "NotAParticipant()",
-	GameIsInProgress: "GameIsInProgress()",
+	WinnerAlreadyDeclared: "WinnerAlreadyDeclared()",
+	NotAPlayer: "NotAPlayer()",
+	GameInProgress: "GameInProgress()",
 	AlreadyRefunded: "AlreadyRefunded()",
-	UnableToProcessRefund: "UnableToProcessRefund()",
-	UnsupportedModel: "UnsupportedModel()",
+	RefundProcessingFailed: "RefundProcessingFailed()",
+	RequestIDExists: "RequestIDExists()",
 };
 
-Object.values(errorSignatures).forEach((v) => [console.log(v, web3.eth.abi.encodeFunctionSignature(v))]);
+// Object.values(errorSignatures).forEach((v) => [console.log(v, web3.eth.abi.encodeFunctionSignature(v))]);
 
 function getErrorName(data) {
 	if (!data) return null;
@@ -40,7 +39,6 @@ function getErrorName(data) {
 
 describe("Game", () => {
 	let game;
-	const modelId = 11;
 
 	before(async function () {
 		// load wallet with accounts
@@ -58,54 +56,40 @@ describe("Game", () => {
 
 		game = new web3.eth.Contract(gameArtifact.abi, gameAddress);
 
-		console.log("\n------------------ GAME SETTINGS -------------");
+		console.log("\n------------------ GAME CONFIG -------------");
 
-		const gameSettings = await game.methods.gameSettings().call();
+		const gameSettings = await game.methods.gameConfig().call();
 
 		console.table(gameSettings);
 	});
 
-	// it("should have a name", async function () {
-	// 	const name = await game.methods.name().call();
+	it("should have a name", async function () {
+		const name = await game.methods.name().call();
 
-	// 	console.log("Game name: ", name);
+		console.log("Game Name: ", name);
 
-	// 	expect(name).to.be.a("string");
-	// });
-
-	it("can estimate callback gas cost", async function () {
-		const gas = await game.methods.getGasEstimate(modelId).call();
-
-		const normalizedGas = +BigInt(gas).toString();
-
-		console.log("Callback Gas Cost: ", normalizedGas);
-
-		expect(normalizedGas).to.be.a("number");
-
-		expect(normalizedGas).to.be.greaterThan(0);
+		expect(name).to.be.a("string");
 	});
 
 	it("can play ", async function () {
 		try {
-			const gas = await game.methods.getGasEstimate(modelId).call();
-
-			const normalizedGas = +BigInt(gas).toString();
-
-			const payableAmount = normalizedGas + constructorArgs.gameSettings.queryFee;
-			const message = "Hello!";
-
-			console.log("Payable Amount: ", payableAmount);
+			const payableAmount = constructorArgs.gameSettings.queryFee;
 
 			// simulate tx with gas estimation
 
-			const estimatedGas = await game.methods.play(message, modelId).estimateGas({
+			const requestId = Math.round(Math.random() * 10000000000);
+			const msg = "Testing Lyra 1-2!";
+
+			// console.log(requestId);
+
+			const estimatedGas = await game.methods.play(requestId, msg).estimateGas({
 				from: wallets[0],
 				value: payableAmount,
 			});
 
 			console.log("Estimated Gas: ", estimatedGas);
 
-			const tx = await game.methods.play(message, modelId).send({
+			const tx = await game.methods.play(requestId, msg).send({
 				from: wallets[0],
 				value: payableAmount,
 				gas: estimatedGas,

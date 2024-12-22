@@ -1,416 +1,290 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
 
-import "hardhat/console.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
-import "./OAO/contracts/interfaces/IAIOracle.sol";
-import "./OAO/contracts/AIOracleCallbackReceiver.sol";
-import "./SystemPrompt.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract Game is Ownable, AIOracleCallbackReceiver {
-    using Strings for uint8;
+contract Game is Ownable, ReentrancyGuard {
     // Structs ---------------
 
-    struct GameSettings {
-        uint256 queryFee;
+    struct GameConfig {
+        uint256 baseQueryFee;
         uint256 queryFeeIncrement;
         uint256 maxQueryFee;
-        uint256 gameDuration;
-        uint256 gameStartTime;
-        uint8 pricePoolPercentage;
-        uint8 devWalletPercentage;
+        uint256 duration;
+        uint256 startTime;
+        uint8 prizePoolPercentage;
+        uint8 developerWalletPercentage;
     }
 
-    struct PlayerQuery {
-        address sender;
+    struct PlayerAttempt {
+        address playerAddress;
         uint256 requestId;
         uint256 fee;
         uint256 timestamp;
-        uint8 score;
-        bool won;
-        bool failed;
-        bool refunded;
+        bool isWinner;
+        bool isRefunded;
     }
 
-    struct AIOracleRequest {
-        address sender;
-        uint256 modelId;
-        bytes input;
-        bytes output;
-        uint256 queryIndex;
-    }
-
-    struct PlayerRequestData {
+    struct PlayerData {
         uint256 requestId;
-        uint256 queryIndex;
-        uint256 pricePoolShare;
-        uint256 devWalletShare;
-        address sender;
-        bytes input;
+        uint256 attemptIndex;
+        uint256 prizePoolShare;
+        uint256 developerShare;
+        address playerAddress;
+        bytes inputData;
     }
 
     // Events -------
 
-    event LyraGameDeployed(uint256 timestamp, GameSettings settings);
-
-    event PlayerAttempt(
-        uint256 requestId,
-        address player,
-        uint256 modelId,
-        string prompt
-    );
-
-    event PlayerAttemptResult(
-        uint256 requestId,
-        address player,
-        uint256 modelId,
-        string prompt,
-        uint8 score,
-        bool won
-    );
-
-    event PlayerRefunded(address player, uint256 refundDue);
-
-    event WinnerAnnouncement(address player);
+    event GameLaunched(uint256 timestamp, GameConfig config);
+    event PlayerAttempted(uint256 requestId, address player, string prompt);
+    event PlayerAttemptResult(uint256 requestId, address player, string prompt);
+    event PlayerRefunded(address player, uint256 refundAmount);
+    event WinnerDeclared(address player);
 
     // Custom Errors ------------
 
-    error AmountLessThanQueryFee();
-    error AmountLessThanQueryFeePlusSlippage();
-    error GameHasNotStarted();
-    error GameHasEnded();
-    error FailedToSendEthers();
-    error AIRequestDoesNotExist();
-    error PlayerQueryDoesNotExist();
+    error InsufficientQueryFee();
+    error InsufficientQueryFeeWithSlippage();
+    error GameNotStarted();
+    error GameEnded();
+    error EtherTransferFailed();
+    error PlayerAttemptNotFound();
     error WinnerRewardConditionsNotMet();
-    error WinnerAlreadyExists();
-    error NotAParticipant();
-    error GameIsInProgress();
+    error WinnerAlreadyDeclared();
+    error NotAPlayer();
+    error GameInProgress();
     error AlreadyRefunded();
-    error UnableToProcessRefund();
-    error UnsupportedModel();
+    error RefundProcessingFailed();
+    error RequestIDExists();
 
     // State Vars -----------
 
-    address public winner;
-    PlayerQuery public winnerQuery;
-    address devWallet;
-    uint256 public initialPricePool;
+    address public currentWinner;
+    PlayerAttempt public winningAttempt;
+    address public developerWallet;
+    uint256 public initialPrizePool;
     uint256 public totalAttempts;
     uint256 public totalPlayers;
-    uint256 public pool;
-    uint8 public queryFeeMinSlippage;
-    GameSettings public gameSettings;
-    mapping(uint256 => uint64) public callbackGasLimit;
-    mapping(uint256 => AIOracleRequest) public requests;
-    mapping(address => mapping(uint256 => PlayerQuery)) public playerQueries;
-    mapping(address => uint256) public playerQueryCount;
+    uint256 public prizePool;
+    uint8 public minSlippagePercentage;
+    GameConfig public gameConfig;
+    mapping(address => uint256[]) public requestIds;
+    mapping(address => mapping(uint256 => PlayerAttempt)) public playerAttempts;
+    mapping(address => uint256) public playerAttemptCount;
 
-    string public constant name = "LyraVerse 01";
-
+    string public constant name = "Lyra 01";
     bytes constant EMPTY_BYTES = bytes("");
 
     constructor(
-        address _devWallet,
         address _owner,
-        GameSettings memory _settings,
-        IAIOracle _aiOracle
-    ) payable Ownable(_owner) AIOracleCallbackReceiver(_aiOracle) {
+        address _developerWallet,
+        GameConfig memory _config
+    ) payable Ownable(_owner) {
         // Sanity Checks
-        require(_devWallet != address(0), "Invalid Dev Wallet");
-
+        require(_developerWallet != address(0), "Invalid Developer Wallet");
+        require(_config.queryFeeIncrement >= 0, "Invalid Query Fee Increment");
+        require(_config.maxQueryFee > 0, "Invalid Max Query Fee");
+        require(_config.duration >= 5 minutes, "Invalid Game Duration");
         require(
-            _settings.queryFeeIncrement >= 0,
-            "Invalid Query Fee Increment"
-        );
-
-        require(_settings.maxQueryFee > 0, "Invalid Max Query Fee");
-
-        require(_settings.gameDuration >= 5 minutes, "Invalid Game Duration");
-
-        require(
-            _settings.devWalletPercentage >= 0 &&
-                _settings.devWalletPercentage <= 100,
+            _config.developerWalletPercentage >= 0 &&
+                _config.developerWalletPercentage <= 100,
             "Must be between 0 and 100"
         );
         require(
-            _settings.pricePoolPercentage >= 0 &&
-                _settings.pricePoolPercentage <= 100,
+            _config.prizePoolPercentage >= 0 &&
+                _config.prizePoolPercentage <= 100,
             "Must be between 0 and 100"
         );
-
         require(
-            _settings.devWalletPercentage + _settings.pricePoolPercentage ==
+            _config.developerWalletPercentage + _config.prizePoolPercentage ==
                 100,
-            "DevWalletPercentage and pricePoolPercentage must sum to 100"
+            "Developer and Prize Pool percentages must sum to 100"
         );
-
         // persist
 
-        devWallet = _devWallet;
+        developerWallet = _developerWallet;
+        gameConfig = _config;
+        initialPrizePool = msg.value;
+        prizePool = msg.value;
 
-        gameSettings = _settings;
-
-        initialPricePool = msg.value;
-
-        pool = msg.value;
-
-        // Preset Gas limits for models
-
-        callbackGasLimit[11] = 5_000_000; // Llama
-
-        emit LyraGameDeployed(block.timestamp, _settings);
+        emit GameLaunched(block.timestamp, _config);
     }
 
     // * PLAY THE GAME ----------
 
     function play(
-        string calldata inputMessage,
-        uint256 modelId
-    ) external payable returns (uint256) {
+        uint256 requestId,
+        string calldata userInput
+    ) external payable nonReentrant returns (PlayerAttempt memory) {
         // Sanity Checks
+        if (gameConfig.startTime > block.timestamp) revert GameNotStarted();
+        if (block.timestamp > (gameConfig.startTime + gameConfig.duration))
+            revert GameEnded();
+        if (currentWinner != address(0)) revert WinnerAlreadyDeclared();
 
-        if (callbackGasLimit[modelId] == 0) {
-            revert UnsupportedModel();
+        if (msg.value < gameConfig.baseQueryFee) {
+            revert InsufficientQueryFee();
         }
 
-        if (gameSettings.gameStartTime > block.timestamp) {
-            revert GameHasNotStarted();
+        if (playerAttempts[msg.sender][requestId].playerAddress != address(0)) {
+            revert RequestIDExists();
         }
 
-        if (
-            block.timestamp >
-            (gameSettings.gameStartTime + gameSettings.gameDuration)
-        ) {
-            revert GameHasEnded();
+        uint256 slippageAmount = (gameConfig.baseQueryFee *
+            minSlippagePercentage) / 100;
+        uint256 expectedQueryFee = gameConfig.baseQueryFee + slippageAmount;
+
+        if (msg.value < expectedQueryFee) {
+            revert InsufficientQueryFeeWithSlippage();
         }
 
-        if (winner != address(0)) {
-            revert WinnerAlreadyExists();
-        }
-
-        // * Gas estimation for OAO callback
-
-        uint256 oaoCallbackGasFee = _estimateCallbackFee(modelId);
-
-        if (msg.value < gameSettings.queryFee + oaoCallbackGasFee) {
-            revert AmountLessThanQueryFee();
-        }
-
-        uint256 slippageAmount = (gameSettings.queryFee * queryFeeMinSlippage) /
-            100;
-
-        uint256 expectedQueryFee = gameSettings.queryFee + slippageAmount;
-
-        if (msg.value < expectedQueryFee + oaoCallbackGasFee) {
-            revert AmountLessThanQueryFeePlusSlippage();
-        }
-
-        uint256 excessQueryFee = msg.value -
-            (gameSettings.queryFee + oaoCallbackGasFee);
+        uint256 excessQueryFee = msg.value - (gameConfig.baseQueryFee);
 
         if (excessQueryFee > 0) {
-            bool success = _sendEthers(msg.sender, excessQueryFee);
-
+            bool success = _transferEther(msg.sender, excessQueryFee);
             if (!success) {
-                revert FailedToSendEthers();
+                revert EtherTransferFailed();
             }
         }
 
-        uint256 value = msg.value - (excessQueryFee + oaoCallbackGasFee);
-
-        PlayerRequestData memory playerData;
-        playerData.devWalletShare =
-            (value * gameSettings.devWalletPercentage) /
+        uint256 netValue = msg.value - (excessQueryFee);
+        PlayerData memory playerData;
+        playerData.developerShare =
+            (netValue * gameConfig.developerWalletPercentage) /
             100;
-
-        playerData.pricePoolShare = value - playerData.devWalletShare;
+        playerData.prizePoolShare = netValue - playerData.developerShare;
 
         // credit dev wallet
 
-        if (playerData.devWalletShare > 0) {
-            bool success = _sendEthers(devWallet, playerData.devWalletShare);
-
+        if (playerData.developerShare > 0) {
+            bool success = _transferEther(
+                developerWallet,
+                playerData.developerShare
+            );
             if (!success) {
-                revert FailedToSendEthers();
+                revert EtherTransferFailed();
             }
         }
 
-        // add to pool
+        // Update prize pool
+        prizePool += playerData.prizePoolShare;
 
-        pool += playerData.pricePoolShare;
-
-        // calculate and set new query fee
-
-        if (gameSettings.queryFee < gameSettings.maxQueryFee) {
-            uint256 newQueryFee = gameSettings.queryFee +
-                (gameSettings.queryFee * gameSettings.queryFeeIncrement) /
+        // Update query fee if applicable
+        if (gameConfig.baseQueryFee < gameConfig.maxQueryFee) {
+            uint256 newQueryFee = gameConfig.baseQueryFee +
+                (gameConfig.baseQueryFee * gameConfig.queryFeeIncrement) /
                 (10 ** 20);
-
-            gameSettings.queryFee = newQueryFee;
+            gameConfig.baseQueryFee = newQueryFee;
         }
 
         // register and process user prompt
 
-        playerData.input = bytes(inputMessage);
-
-        if (playerQueryCount[msg.sender] == 0) {
+        playerData.inputData = bytes(userInput);
+        if (playerAttemptCount[msg.sender] == 0) {
             totalPlayers += 1;
         }
 
-        playerQueryCount[msg.sender] += 1;
-
+        playerAttemptCount[msg.sender] += 1;
         totalAttempts += 1;
 
-        playerData.requestId = _processPrompt(
-            modelId,
-            _getPromptWithUserMessage(playerData.input),
-            EMPTY_BYTES,
-            oaoCallbackGasFee
-        );
+        playerData.requestId = requestId;
+        playerData.playerAddress = msg.sender;
 
-        playerData.queryIndex = playerQueryCount[msg.sender];
-        playerData.sender = msg.sender;
+        requestIds[playerData.playerAddress].push(requestId);
 
-        requests[playerData.requestId] = AIOracleRequest({
-            sender: playerData.sender,
-            modelId: modelId,
-            input: playerData.input,
-            output: EMPTY_BYTES,
-            queryIndex: playerData.queryIndex
-        });
-
-        playerQueries[msg.sender][playerData.queryIndex] = PlayerQuery({
-            sender: playerData.sender,
+        playerAttempts[msg.sender][requestId] = PlayerAttempt({
+            playerAddress: playerData.playerAddress,
             timestamp: block.timestamp,
             requestId: playerData.requestId,
-            fee: playerData.pricePoolShare,
-            won: false,
-            failed: false,
-            refunded: false,
-            score: 0
+            fee: playerData.prizePoolShare,
+            isWinner: false,
+            isRefunded: false
         });
 
-        emit PlayerAttempt(
-            playerData.requestId,
-            msg.sender,
-            modelId,
-            inputMessage
-        );
-
-        return playerData.requestId;
+        emit PlayerAttempted(playerData.requestId, msg.sender, userInput);
+        return playerAttempts[msg.sender][requestId];
     }
 
-    // * RESPONSE FROM OAO ----
+    // * DECLARE WINNER ----
 
-    function aiOracleCallback(
+    function declareWinner(
         uint256 requestId,
-        bytes calldata output,
-        bytes calldata callbackData
-    ) external override onlyAIOracleCallback {
-        AIOracleRequest memory request = requests[requestId];
+        address winnerAddress
+    ) external onlyOwner {
+        if (gameConfig.startTime > block.timestamp) revert GameNotStarted();
 
-        if (request.sender == address(0)) {
-            revert AIRequestDoesNotExist();
-        }
+        if (block.timestamp > (gameConfig.startTime + gameConfig.duration))
+            revert GameEnded();
 
-        request.output = output;
-
-        requests[requestId] = request;
-
-        PlayerQuery memory playerQuery = playerQueries[request.sender][
-            request.queryIndex
+        PlayerAttempt storage playerAttempt = playerAttempts[winnerAddress][
+            requestId
         ];
 
-        if (playerQuery.sender == address(0)) {
-            revert PlayerQueryDoesNotExist();
-        }
-
-        uint8 playerScore = _decodeScore(output);
-
-        if (playerScore == 200) {
-            playerQuery.failed = true;
-        }
-
-        playerQuery.score = playerScore;
-
-        bool playerWon = (playerScore == 100);
-
-        playerQuery.won = playerWon;
-
-        // * final update to playerQuery here, no further updates allowed
-
-        playerQueries[request.sender][request.queryIndex] = playerQuery;
-
-        emit PlayerAttemptResult(
-            requestId,
-            request.sender,
-            request.modelId,
-            string(request.input),
-            playerScore,
-            playerWon
+        require(
+            winnerAddress == playerAttempt.playerAddress,
+            " Winner address does not match player address "
         );
 
-        // Handle When Player Wins
-
-        if (playerWon) {
-            winner = request.sender;
-
-            winnerQuery = playerQuery;
-
-            emit WinnerAnnouncement(request.sender);
-
-            // disburse fund to winner
-
-            if (pool > 0 && address(this).balance > 0) {
-                uint256 reward = pool;
-
-                if (pool > address(this).balance) {
-                    reward = address(this).balance;
-                }
-
-                bool success = _sendEthers(winner, reward);
-
-                if (!success) {
-                    revert FailedToSendEthers();
-                }
-            } else {
-                revert WinnerRewardConditionsNotMet();
-            }
+        if (playerAttempt.playerAddress == address(0)) {
+            revert NotAPlayer();
         }
+
+        if (currentWinner != address(0)) {
+            revert WinnerAlreadyDeclared();
+        }
+
+        currentWinner = winnerAddress;
+        playerAttempt.isWinner = true;
+        winningAttempt = playerAttempt;
+
+        if (prizePool == 0 || address(this).balance == 0)
+            revert WinnerRewardConditionsNotMet();
+
+        uint256 reward = (prizePool > address(this).balance)
+            ? address(this).balance
+            : prizePool;
+
+        if (!_transferEther(currentWinner, reward))
+            revert EtherTransferFailed();
+
+        emit WinnerDeclared(currentWinner);
     }
 
     // * REFUND IN CASE OF NO WINNER AND GAME ENDED
 
-    function refundPlayer() external {
+    function getRefund() external nonReentrant {
         // Sanity checks
 
-        if (playerQueryCount[msg.sender] == 0) {
-            revert NotAParticipant();
+        if (gameConfig.startTime > block.timestamp) revert GameNotStarted();
+
+        if ((gameConfig.startTime + gameConfig.duration) > block.timestamp) {
+            revert GameInProgress();
         }
 
-        if (winner != address(0)) {
-            revert WinnerAlreadyExists();
+        if (playerAttemptCount[msg.sender] == 0) {
+            revert NotAPlayer();
         }
 
-        if (
-            (gameSettings.gameStartTime + gameSettings.gameDuration) >
-            block.timestamp
-        ) {
-            revert GameIsInProgress();
+        if (currentWinner != address(0)) {
+            revert WinnerAlreadyDeclared();
         }
 
         uint256 refundDue = 0;
 
-        for (uint256 i = 1; i <= playerQueryCount[msg.sender]; i++) {
-            if (
-                playerQueries[msg.sender][i].sender == msg.sender &&
-                !playerQueries[msg.sender][i].refunded
-            ) {
-                playerQueries[msg.sender][i].refunded = true;
+        for (uint256 i = 0; i < requestIds[msg.sender].length; i++) {
+            PlayerAttempt storage playerAttempt = playerAttempts[msg.sender][
+                requestIds[msg.sender][i]
+            ];
 
-                refundDue += playerQueries[msg.sender][i].fee;
+            if (
+                playerAttempt.playerAddress == msg.sender &&
+                !playerAttempt.isRefunded
+            ) {
+                playerAttempt.isRefunded = true;
+
+                refundDue += playerAttempt.fee;
             }
         }
 
@@ -419,44 +293,18 @@ contract Game is Ownable, AIOracleCallbackReceiver {
         }
 
         if (address(this).balance >= refundDue) {
-            bool success = _sendEthers(msg.sender, refundDue);
-
-            if (!success) {
-                revert FailedToSendEthers();
-            }
+            if (!_transferEther(msg.sender, refundDue))
+                revert EtherTransferFailed();
 
             emit PlayerRefunded(msg.sender, refundDue);
         } else {
-            revert UnableToProcessRefund();
+            revert RefundProcessingFailed();
         }
-    }
-
-    // *FETCH SYSTEM PROMPT
-    function getPrompt() external pure returns (string memory) {
-        return SystemPrompt.PROMPT;
-    }
-
-    // *FETCH GAS ESTIMATE FOR OAO MODEL CALLBACK
-
-    function getGasEstimate(uint256 modelId) external view returns (uint256) {
-        return _estimateCallbackFee(modelId);
     }
 
     // Internal Functions -------------------
 
-    function _getPromptWithUserMessage(
-        bytes memory userAttempt
-    ) internal pure returns (bytes memory) {
-        return
-            abi.encodePacked(
-                bytes(SystemPrompt.PROMPT),
-                "User's Attempt:\n'",
-                userAttempt,
-                "'\n"
-            );
-    }
-
-    function _sendEthers(
+    function _transferEther(
         address _recipient,
         uint256 _amount
     ) internal returns (bool) {
@@ -465,54 +313,16 @@ contract Game is Ownable, AIOracleCallbackReceiver {
         return success;
     }
 
-    function _processPrompt(
-        uint256 modelId,
-        bytes memory input,
-        bytes memory callbackData,
-        uint256 gasValue
-    ) internal returns (uint256) {
-        address callbackAddress = address(this);
-
-        uint256 requestId = aiOracle.requestCallback{value: gasValue}(
-            modelId,
-            input,
-            callbackAddress,
-            callbackGasLimit[modelId],
-            callbackData
-        );
-
-        return requestId;
-    }
-
-    function _decodeScore(bytes memory score) internal pure returns (uint8) {
-        for (uint8 i = 0; i <= 100; i++) {
-            if (keccak256(score) == keccak256(bytes(i.toString()))) {
-                return i;
-            }
-        }
-
-        return 200;
-    }
-
-    function _estimateCallbackFee(
-        uint256 modelId
-    ) internal view returns (uint256) {
-        return aiOracle.estimateFee(modelId, callbackGasLimit[modelId]);
-    }
-
     // Admin funcs ------------
 
-    function setCallbackGasLimit(
-        uint256 modelId,
-        uint64 gasLimit
-    ) external onlyOwner {
-        callbackGasLimit[modelId] = gasLimit;
-    }
-
-    function setDevWallet(address _devWallet) external onlyOwner {
+    function setDeveloperWallet(address _devWallet) external onlyOwner {
         require(_devWallet != address(0), "Invalid Dev Wallet");
 
-        devWallet = _devWallet;
+        developerWallet = _devWallet;
+    }
+
+    function updateConfig(GameConfig memory _config) external onlyOwner {
+        gameConfig = _config;
     }
 
     function setMinSlippgae(uint8 _slippage) external onlyOwner {
@@ -520,6 +330,6 @@ contract Game is Ownable, AIOracleCallbackReceiver {
             _slippage >= 0 && _slippage <= 100,
             "Slippage must be between 0 and 100"
         );
-        queryFeeMinSlippage = _slippage;
+        minSlippagePercentage = _slippage;
     }
 }
